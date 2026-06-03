@@ -1,40 +1,93 @@
-#!/usr/bin/env bash
-# review-pr.sh - revue de PR par agent IA (revue + sécurité + changelog).
-# Solution de reference J9 (GitHub). Lit un diff sur stdin, renvoie sur stdout
-# un tableau JSON de findings {file, line, severity, category, message}.
-# severity E {critical, warning, info}. Tableau vide [] si la PR est propre.
-# Usage : git diff origin/main ... HEAD | ./review-pr.sh > review. json
-  set -euo pipefail
-  
-  DIFF="$(cat)"
-PROMPT="Tu es un relecteur de PR senior. Audite ce diff sur TROIS axes :
-1. REVUE : bugs, regressions, et surtout un test supprime/affaibli pour faire passer la CI.
-2. SECURITE : secret/token en dur, injection SQL, bypass d'auth, donnees sensibles.
-3. CHANGELOG : comportement public modifié (nouvelle fonction/signature) sans entree sous '## [Unreleased]' dans CHANGELOG.md.
+name: ai-review
 
-Réponds UNIQUEMENT par un tableau JSON (aucun texte autour, pas de balises). Chaque élément :
-  {\"file\": str, \"line\": int|null, \"severity\": \"critical|warning|info\", \"category\": str, \"message\": str}
-Règles de sévérité :
-  - secret/token en dur, injection SQL, test supprimé pour passer la CI => \"critical\"
-  - print()/console. log de debug oublie, code mort, changelog manquant => \"warning\"
-  - style mineur => \"info\" Tableau vide [] si la PR est propre. N'invente jamais un fichier/ligne hors du diff.
+on:
+  pull_request:
+    types: [opened, synchronize]
 
-DIFF :
-  $DIFF"
-  
-  # Appel headless ; on extrait le texte du message 'result' du flux stream-json.
-  
-  RAW="$(claude -p "$PROMPT" --output-format stream-json --verbose --dangerously-skip-permissions | jq -rc 'select(.type == "result") | .result')"
-  
-  # Isole le tableau JSON dans la reponse, du PREMIER '[' au DERNIER ']'.
-  # (robuste aux ']' presents DANS les messages, ex. "[Unreleased]" - un sed naïf
-  # tronquerait au premier ']' et casserait le JSON).
-  printf '%s' "$RAW" | tr -d '\000' | python3 -c '
-  import sys, json
-  d = sys.stdin.read()
-  i, j= d.find("["), d.rfind("]")
-try:
-  print(json.dumps(json.loads(d[i:j+1]), ensure_ascii=False) if i >= 0 and j > i else "[]")
-except Exception:
-  print("[]")
-  '
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: install claude-code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: extract diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+
+      - name: ai review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          chmod +x review-pr.sh
+          cat /tmp/pr.diff | ./review-pr.sh > /tmp/review.json
+
+      - name: post comments + gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 << 'EOF'
+          import json, os, sys, urllib.request
+
+          with open('/tmp/review.json') as f:
+              findings = json.load(f)
+
+          token = os.environ['GITHUB_TOKEN']
+          repo = os.environ['GITHUB_REPOSITORY']
+          pr_number = os.environ['PR_NUMBER']
+          head_sha = os.environ['HEAD_SHA']
+
+          headers = {
+              'Authorization': f'Bearer {token}',
+              'Accept': 'application/vnd.github+json',
+              'Content-Type': 'application/json',
+              'X-GitHub-Api-Version': '2022-11-28',
+          }
+
+          def post(url, body):
+              req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+              try:
+                  with urllib.request.urlopen(req):
+                      pass
+              except Exception as e:
+                  print(f'warn: {e}', file=sys.stderr)
+
+          base = f'https://api.github.com/repos/{repo}'
+
+          for finding in findings:
+              severity = finding.get('severity', 'info').upper()
+              category = finding.get('category', '')
+              message = finding.get('message', '')
+              body_text = f'**[{severity}] {category}**\n\n{message}'
+
+              if finding.get('line') and finding.get('file'):
+                  post(f'{base}/pulls/{pr_number}/comments', {
+                      'body': body_text,
+                      'commit_id': head_sha,
+                      'path': finding['file'],
+                      'line': int(finding['line']),
+                      'side': 'RIGHT',
+                  })
+              else:
+                  post(f'{base}/issues/{pr_number}/comments', {'body': body_text})
+
+          has_critical = any(f.get('severity') == 'critical' for f in findings)
+          if has_critical:
+              print('::error::AI review blocked: critical finding(s) detected.')
+              sys.exit(1)
+          EOF
