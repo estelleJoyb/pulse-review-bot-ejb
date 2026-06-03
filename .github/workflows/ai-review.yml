@@ -12,6 +12,11 @@ jobs:
       pull-requests: write
 
     steps:
+      - name: mask secrets
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: echo "::add-mask::$ANTHROPIC_API_KEY"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
