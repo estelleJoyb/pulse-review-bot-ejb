@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Lit un diff sur stdin, renvoie sur stdout un tableau JSON de findings.
+# {file, line, severity, category, message} — severity: critical|warning|info
+# Usage : git diff origin/main...HEAD | ./review-pr.sh > review.json
+set -euo pipefail
+
+DIFF="$(cat)"
+PROMPT="Tu es un relecteur de PR senior. Audite ce diff sur TROIS axes :
+1. REVUE : bugs, regressions, et surtout un test supprime/affaibli pour faire passer la CI.
+2. SECURITE : secret/token en dur, injection SQL, bypass d'auth, donnees sensibles.
+3. CHANGELOG : comportement public modifié (nouvelle fonction/signature) sans entree sous '## [Unreleased]' dans CHANGELOG.md.
+
+Réponds UNIQUEMENT par un tableau JSON (aucun texte autour, pas de balises). Chaque élément :
+  {\"file\": str, \"line\": int|null, \"severity\": \"critical|warning|info\", \"category\": str, \"message\": str}
+Règles de sévérité :
+  - secret/token en dur, injection SQL, test supprimé pour passer la CI => \"critical\"
+  - print()/console.log de debug oublié, code mort, changelog manquant => \"warning\"
+  - style mineur => \"info\"
+Tableau vide [] si la PR est propre. N'invente jamais un fichier/ligne hors du diff.
+
+DIFF :
+$DIFF"
+
+RAW="$(claude -p "$PROMPT" --output-format stream-json --verbose --dangerously-skip-permissions \
+  | jq -rc 'select(.type == "result") | .result')"
+
+printf '%s' "$RAW" | tr -d '\000' | python3 -c '
+import sys, json
+d = sys.stdin.read()
+i, j = d.find("["), d.rfind("]")
+try:
+    print(json.dumps(json.loads(d[i:j+1]), ensure_ascii=False) if i >= 0 and j > i else "[]")
+except Exception:
+    print("[]")
+'
